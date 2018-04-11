@@ -49,8 +49,58 @@ https://docs.microsoft.com/en-us/windows-hardware/drivers/other-wdk-downloads
 
 Deployment Instructions
 ------------------------
+### Automatic Provisioning
+Using Visual Studio to deploy modified drivers should simplify testing code changes.
+
+However, this process does not work 100% of the time (from what I observe). You may need to set the debug target to test mode to manually complete driver installation at the end of these instructions.
+
+(Below instructions are simplified; view full instructions at  
+https://docs.microsoft.com/en-us/windows-hardware/drivers/gettingstarted/provision-a-target-computer-wdk-8-1 )
+
+#### First-Time Setup
+> Note: This setup process will reboot the debug target a couple of times and configure the machine to auto-logon as a new debug user.
+
+1. On the debug host, locate the WDK Test Target Setup MSI matching the platform of the target host. This MSI can be found in the WDK installation directory under '\\Remote\\', e.g.:  
+	%ProgramFiles(x86)%\\Windows Kits\\10\\Remote\\x64\\WDK Test Target Setup x64-x64_en-us.msi
+2. Copy this MSI to and install on the debug target.
+3. On the debug host, through the Visual Studio menu bar, select 'Driver&nbsp;> Test&nbsp;> Configure Devices...'.
+4. Click 'Add new device' and set up desired debug configuration.
+
+#### Repeated Steps (on reboot)
+_This is probably totally scriptable._
+
+5. When the provisioning process is complete,  
+	the boot configuration may need to be edited to allow for manual driver installation.  
+	Unfortunately, this step may have to be repeated whenever the debug target is power cycled:
+	
+	<!--DUPL:EnableWinTestMode-->
+	_As an administrator,_ run the following commands:
+	```
+	bcdedit.exe /set nointegritychecks off
+	bcdedit.exe /set testsigning on
+
+	:: Also enable kernel debugging to specify debug output
+	:: (use same debug settings as provisioning config):
+	:: Example commands if kernel debugging over ethernet
+	SET HostIP=1.2.3.4
+	SET Port=12321
+	bcdedit.exe /debug on
+	bcdedit.exe /dbgsettings net hostip:%HostIP% port:%Port%
+	```
+
+#### Repeated Steps: Driver Deployment
+_For whenever changes are made to the driver._
+
+6. On the debug host, in the Visual Studio menu bar,  
+	build the driver via 'Build&nbsp;> Build FsFltStrhide'.
+7. Deploy the driver via 'Build&nbsp;> Deploy FsFltStrhide'.
+8. On the debug target, navigate to 'C:\\DriverTest\\Drivers\\'  
+	and install the driver via right-clicking the .inf file and selecting 'Install'.
+9. Load the driver by opening an _adminstrative_ command prompt and entering command:  
+	`fltmc load FsFltStrhide`
+
 ### Manual
-It is generally recommended to use remote kernel debugging, but some situations may prevent you from doing so.
+It is generally recommended to use automatic provisioning (since it handles driver uninstallation and installs debugging symbols), but some situations may prevent you from doing so.
 
 To observe kernel debug output from this driver, you may wish to enable kernel debugging on the debug target to connect to it.
 
@@ -59,6 +109,7 @@ To observe kernel debug output from this driver, you may wish to enable kernel d
 	![A .cer, .inf, .pdb, and .sys file is produced](docs-assets/build_output.png)
 1. On the debug target, we will disable signed driver enforcement. This a security feature since Windows Vista(ish?) to help defend against rootkits. Much like what we're installing right now.  
 	Not disabling this will have Windows blocking either installation of the driver or its startup.  
+	&#8203;<!--DUPL:EnableWinTestMode-->
 	_As an administrator,_ run the following commands:
 	```
 	bcdedit.exe /set nointegritychecks off
