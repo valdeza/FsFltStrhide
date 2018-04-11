@@ -26,14 +26,55 @@ ULONG_PTR OperationStatusCtx = 1;
 
 #define PTDBG_TRACE_ROUTINES            0x00000001
 #define PTDBG_TRACE_OPERATION_STATUS    0x00000002
+#define PTDBG_TRACE_ERROR               0x00000004
 
-ULONG gTraceFlags = 0x3;
+ULONG gTraceFlags = 0x7;
 
 
 #define PT_DBG_PRINT( _dbgLevel, _string )          \
     (FlagOn(gTraceFlags,(_dbgLevel)) ?              \
         DbgPrint _string :                          \
         ((int)0))
+
+#define PT_DBG_PRINTEX( _ctDbgLevel, _dpfltDbgLevel, _fstring, ... ) \
+    (FlagOn(gTraceFlags,(_ctDbgLevel)) ? \
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, (_dpfltDbgLevel), (_fstring), __VA_ARGS__ ) : \
+        ((int)0))
+
+
+/*************************************************************************
+Pool Tags
+*************************************************************************/
+
+#define CONTEXT_TAG         'xcBS'
+#define NAME_TAG            'mnBS'
+
+/*************************************************************************
+Local structures
+*************************************************************************/
+
+//
+//  This is a volume context, one of these are attached to each volume
+//  we monitor.  This is used to get a "DOS" name for debug display.
+//
+
+typedef struct _VOLUME_CONTEXT {
+
+    //
+    //  Holds the name to display
+    //
+
+    UNICODE_STRING Name;
+
+    //
+    //  Holds the sector size for this volume.
+    //
+
+    ULONG SectorSize;
+
+} VOLUME_CONTEXT, *PVOLUME_CONTEXT;
+
+#define MIN_SECTOR_SIZE 0x200
 
 /*************************************************************************
     Prototypes
@@ -57,6 +98,12 @@ FsFltStrhideInstanceSetup (
     );
 
 VOID
+CleanupVolumeContext(
+    _In_ PFLT_CONTEXT Context,
+    _In_ FLT_CONTEXT_TYPE ContextType
+    );
+
+VOID
 FsFltStrhideInstanceTeardownStart (
     _In_ PCFLT_RELATED_OBJECTS FltObjects,
     _In_ FLT_INSTANCE_TEARDOWN_FLAGS Flags
@@ -77,6 +124,13 @@ NTSTATUS
 FsFltStrhideInstanceQueryTeardown (
     _In_ PCFLT_RELATED_OBJECTS FltObjects,
     _In_ FLT_INSTANCE_QUERY_TEARDOWN_FLAGS Flags
+    );
+
+FLT_PREOP_CALLBACK_STATUS
+StrhidePreRead(
+    _Inout_ PFLT_CALLBACK_DATA Data,
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _Flt_CompletionContext_Outptr_ PVOID *CompletionContext
     );
 
 FLT_PREOP_CALLBACK_STATUS
@@ -125,8 +179,10 @@ EXTERN_C_END
 #pragma alloc_text(PAGE, FsFltStrhideUnload)
 #pragma alloc_text(PAGE, FsFltStrhideInstanceQueryTeardown)
 #pragma alloc_text(PAGE, FsFltStrhideInstanceSetup)
+#pragma alloc_text(PAGE, CleanupVolumeContext)
 #pragma alloc_text(PAGE, FsFltStrhideInstanceTeardownStart)
 #pragma alloc_text(PAGE, FsFltStrhideInstanceTeardownComplete)
+#pragma alloc_text(PAGE, StrhidePreRead)
 #endif
 
 //
@@ -150,12 +206,12 @@ CONST FLT_OPERATION_REGISTRATION Callbacks[] = {
       0,
       FsFltStrhidePreOperation,
       FsFltStrhidePostOperation },
-
+#endif
     { IRP_MJ_READ,
       0,
-      FsFltStrhidePreOperation,
-      FsFltStrhidePostOperation },
-
+      StrhidePreRead,
+      NULL }, //optional
+#if 0
     { IRP_MJ_WRITE,
       0,
       FsFltStrhidePreOperation,
@@ -337,6 +393,23 @@ CONST FLT_OPERATION_REGISTRATION Callbacks[] = {
 };
 
 //
+//  Context definitions we currently care about.  Note that the system will
+//  create a lookAside list for the volume context because an explicit size
+//  of the context is specified.
+//
+
+CONST FLT_CONTEXT_REGISTRATION ContextNotifications[] = {
+
+     { FLT_VOLUME_CONTEXT,
+       0,
+       CleanupVolumeContext,
+       sizeof(VOLUME_CONTEXT),
+       CONTEXT_TAG },
+
+     { FLT_CONTEXT_END }
+};
+
+//
 //  This defines what we want to filter with FltMgr
 //
 
@@ -346,7 +419,7 @@ CONST FLT_REGISTRATION FilterRegistration = {
     FLT_REGISTRATION_VERSION,           //  Version
     0,                                  //  Flags
 
-    NULL,                               //  Context
+    ContextNotifications,               //  Context
     Callbacks,                          //  Operation callbacks
 
     FsFltStrhideUnload,                           //  MiniFilterUnload
@@ -375,11 +448,13 @@ FsFltStrhideInstanceSetup (
 
 Routine Description:
 
-    This routine is called whenever a new instance is created on a volume. This
-    gives us a chance to decide if we need to attach to this volume or not.
+    This routine is called whenever a new instance is created on a volume.
 
-    If this routine is not defined in the registration structure, automatic
-    instances are always created.
+    By default we want to attach to all volumes.  This routine will try and
+    get a "DOS" name for the given volume.  If it can't, it will try and
+    get the "NT" name for the volume (which is what happens on network
+    volumes).  If a name is retrieved a volume context will be created with
+    that name.
 
 Arguments:
 
@@ -395,7 +470,15 @@ Return Value:
 
 --*/
 {
-    UNREFERENCED_PARAMETER( FltObjects );
+    PDEVICE_OBJECT devObj = NULL;
+    PVOLUME_CONTEXT ctx = NULL;
+    NTSTATUS status = STATUS_SUCCESS;
+    ULONG retLen;
+    PUNICODE_STRING workingName;
+    USHORT size;
+    UCHAR volPropBuffer[sizeof(FLT_VOLUME_PROPERTIES) + 512];
+    PFLT_VOLUME_PROPERTIES volProp = (PFLT_VOLUME_PROPERTIES)volPropBuffer;
+
     UNREFERENCED_PARAMETER( Flags );
     UNREFERENCED_PARAMETER( VolumeDeviceType );
     UNREFERENCED_PARAMETER( VolumeFilesystemType );
@@ -405,7 +488,240 @@ Return Value:
     PT_DBG_PRINT( PTDBG_TRACE_ROUTINES,
                   ("FsFltStrhide!FsFltStrhideInstanceSetup: Entered\n") );
 
-    return STATUS_SUCCESS;
+    try {
+
+        //
+        //  Allocate a volume context structure.
+        //
+
+        status = FltAllocateContext( FltObjects->Filter,
+                                     FLT_VOLUME_CONTEXT,
+                                     sizeof(VOLUME_CONTEXT),
+                                     NonPagedPool,
+                                     &ctx );
+
+        if (!NT_SUCCESS(status)) {
+
+            //
+            //  We could not allocate a context, quit now
+            //
+
+            leave;
+        }
+
+        //
+        //  Always get the volume properties, so I can get a sector size
+        //
+
+        status = FltGetVolumeProperties( FltObjects->Volume,
+                                         volProp,
+                                         sizeof(volPropBuffer),
+                                         &retLen );
+
+        if (!NT_SUCCESS(status)) {
+
+            leave;
+        }
+
+        //
+        //  Save the sector size in the context for later use.  Note that
+        //  we will pick a minimum sector size if a sector size is not
+        //  specified.
+        //
+
+        FLT_ASSERT((volProp->SectorSize == 0) || (volProp->SectorSize >= MIN_SECTOR_SIZE));
+
+        ctx->SectorSize = max(volProp->SectorSize,MIN_SECTOR_SIZE);
+
+        //
+        //  Init the buffer field (which may be allocated later).
+        //
+
+        ctx->Name.Buffer = NULL;
+
+        //
+        //  Get the storage device object we want a name for.
+        //
+
+        status = FltGetDiskDeviceObject( FltObjects->Volume, &devObj );
+
+        if (NT_SUCCESS(status)) {
+
+            //
+            //  Try and get the DOS name.  If it succeeds we will have
+            //  an allocated name buffer.  If not, it will be NULL
+            //
+
+            status = IoVolumeDeviceToDosName( devObj, &ctx->Name );
+        }
+
+        //
+        //  If we could not get a DOS name, get the NT name.
+        //
+
+        if (!NT_SUCCESS(status)) {
+
+            FLT_ASSERT(ctx->Name.Buffer == NULL);
+
+            //
+            //  Figure out which name to use from the properties
+            //
+
+            if (volProp->RealDeviceName.Length > 0) {
+
+                workingName = &volProp->RealDeviceName;
+
+            } else if (volProp->FileSystemDeviceName.Length > 0) {
+
+                workingName = &volProp->FileSystemDeviceName;
+
+            } else {
+
+                //
+                //  No name, don't save the context
+                //
+
+                status = STATUS_FLT_DO_NOT_ATTACH;
+                leave;
+            }
+
+            //
+            //  Get size of buffer to allocate.  This is the length of the
+            //  string plus room for a trailing colon.
+            //
+
+            size = workingName->Length + sizeof(WCHAR);
+
+            //
+            //  Now allocate a buffer to hold this name
+            //
+
+#pragma prefast(suppress:__WARNING_MEMORY_LEAK, "ctx->Name.Buffer will not be leaked because it is freed in CleanupVolumeContext")
+            ctx->Name.Buffer = ExAllocatePoolWithTag( NonPagedPool,
+                                                      size,
+                                                      NAME_TAG );
+            if (ctx->Name.Buffer == NULL) {
+
+                status = STATUS_INSUFFICIENT_RESOURCES;
+                leave;
+            }
+
+            //
+            //  Init the rest of the fields
+            //
+
+            ctx->Name.Length = 0;
+            ctx->Name.MaximumLength = size;
+
+            //
+            //  Copy the name in
+            //
+
+            RtlCopyUnicodeString( &ctx->Name,
+                                  workingName );
+
+            //
+            //  Put a trailing colon to make the display look good
+            //
+
+            RtlAppendUnicodeToString( &ctx->Name,
+                                      L":" );
+        }
+
+        //
+        //  Set the context
+        //
+
+        status = FltSetVolumeContext( FltObjects->Volume,
+                                      FLT_SET_CONTEXT_KEEP_IF_EXISTS,
+                                      ctx,
+                                      NULL );
+
+        //
+        //  Log debug info
+        //
+
+        PT_DBG_PRINTEX( PTDBG_TRACE_OPERATION_STATUS, DPFLTR_TRACE_LEVEL,
+            "FsFltStrhide!FsFltStrhideInstanceSetup:                  Real SectSize=0x%04x, Used SectSize=0x%04x, Name=\"%wZ\"\n",
+                    volProp->SectorSize,
+                    ctx->SectorSize,
+                    &ctx->Name);
+
+        //
+        //  It is OK for the context to already be defined.
+        //
+
+        if (status == STATUS_FLT_CONTEXT_ALREADY_DEFINED) {
+
+            status = STATUS_SUCCESS;
+        }
+
+    } finally {
+
+        //
+        //  Always release the context.  If the set failed, it will free the
+        //  context.  If not, it will remove the reference added by the set.
+        //  Note that the name buffer in the ctx will get freed by the context
+        //  cleanup routine.
+        //
+
+        if (ctx) {
+
+            FltReleaseContext( ctx );
+        }
+
+        //
+        //  Remove the reference added to the device object by
+        //  FltGetDiskDeviceObject.
+        //
+
+        if (devObj) {
+
+            ObDereferenceObject( devObj );
+        }
+    }
+
+    return status;
+}
+
+
+VOID
+CleanupVolumeContext(
+    _In_ PFLT_CONTEXT Context,
+    _In_ FLT_CONTEXT_TYPE ContextType
+    )
+/*++
+
+Routine Description:
+
+    The given context is being freed.
+    Free the allocated name buffer if there one.
+
+Arguments:
+
+    Context - The context being freed
+
+    ContextType - The type of context this is
+
+Return Value:
+
+    None
+
+--*/
+{
+    PVOLUME_CONTEXT ctx = Context;
+
+    PAGED_CODE();
+
+    UNREFERENCED_PARAMETER( ContextType );
+
+    FLT_ASSERT(ContextType == FLT_VOLUME_CONTEXT);
+
+    if (ctx->Name.Buffer != NULL) {
+
+        ExFreePool(ctx->Name.Buffer);
+        ctx->Name.Buffer = NULL;
+    }
 }
 
 
@@ -622,6 +938,99 @@ Return Value:
 /*************************************************************************
     MiniFilter callback routines.
 *************************************************************************/
+FLT_PREOP_CALLBACK_STATUS
+StrhidePreRead(
+    _Inout_ PFLT_CALLBACK_DATA Data,
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _Flt_CompletionContext_Outptr_ PVOID *CompletionContext
+    )
+/*++
+Routine Description:
+
+    This routine detects the presence of the target byte sequence
+    and prints debug output on where it has been detected.
+
+Arguments:
+
+    Data - Pointer to the filter callbackData that is passed to us.
+
+    FltObjects - Pointer to the FLT_RELATED_OBJECTS data structure containing
+        opaque handles to this filter, instance, its associated volume and
+        file object.
+
+    CompletionContext - Receives the context that will be passed to the
+        post-operation callback.
+
+Return Value:
+
+    FLT_PREOP_SUCCESS_WITH_CALLBACK - we want a postOperation callback
+
+    FLT_PREOP_SUCCESS_NO_CALLBACK - we don't want a postOperation callback
+
+--*/
+{
+    PFLT_IO_PARAMETER_BLOCK iopb = Data->Iopb;
+    FLT_PREOP_CALLBACK_STATUS retValue = FLT_PREOP_SUCCESS_NO_CALLBACK;
+    PVOLUME_CONTEXT volCtx = NULL;
+    NTSTATUS status;
+    ULONG readLen = iopb->Parameters.Read.Length;
+    PVOID readbufAddr = iopb->Parameters.Read.ReadBuffer;
+
+    UNREFERENCED_PARAMETER(CompletionContext);
+
+    try {
+
+        //
+        //  If they are trying to read ZERO bytes, then don't do anything and
+        //  we don't need a post-operation callback.
+        //
+
+        if (readLen == 0) {
+
+            leave;
+        }
+
+        //
+        //  Get our volume context so we can display our volume name in the
+        //  debug output.
+        //
+
+        status = FltGetVolumeContext( FltObjects->Filter,
+                                      FltObjects->Volume,
+                                      &volCtx );
+
+        if (!NT_SUCCESS(status)) {
+
+            PT_DBG_PRINTEX( PTDBG_TRACE_ERROR, DPFLTR_ERROR_LEVEL,
+                "FsFltStrhide!StrhidePreRead: Error getting volume context, status=%x\n",
+                status);
+
+            leave;
+        }
+
+        PT_DBG_PRINTEX( PTDBG_TRACE_OPERATION_STATUS, DPFLTR_TRACE_LEVEL,
+            "FsFltStrhide!StrhidePreRead: %wZ bufaddr=%p mdladdr=%p len=%d\n",
+            &volCtx->Name,
+            iopb->Parameters.Read.ReadBuffer,
+            iopb->Parameters.Read.MdlAddress,
+            readLen);
+
+    } finally {
+
+        //
+        //  Cleanup state.
+        //
+
+        if (volCtx != NULL) {
+            FltReleaseContext( volCtx );
+        }
+    }
+
+    return retValue;
+}
+
+
+
 FLT_PREOP_CALLBACK_STATUS
 FsFltStrhidePreOperation (
     _Inout_ PFLT_CALLBACK_DATA Data,
