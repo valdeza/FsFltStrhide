@@ -506,6 +506,11 @@ Return Value:
             //  We could not allocate a context, quit now
             //
 
+            PT_DBG_PRINTEX( PTDBG_TRACE_ERROR, DPFLTR_ERROR_LEVEL,
+                "FsFltStrhide!FsFltStrhideInstanceSetup: Failed to create volume context with status 0x%x. (FltObjects @ %p)\n",
+                status,
+                FltObjects );
+
             leave;
         }
 
@@ -972,6 +977,8 @@ Return Value:
     PFLT_IO_PARAMETER_BLOCK iopb = Data->Iopb;
     FLT_PREOP_CALLBACK_STATUS retValue = FLT_PREOP_SUCCESS_NO_CALLBACK;
     PVOLUME_CONTEXT volCtx = NULL;
+    PFLT_FILE_NAME_INFORMATION filenameInfo = NULL;
+
     NTSTATUS status;
     ULONG readLen = iopb->Parameters.Read.Length;
     PVOID readbufAddr = iopb->Parameters.Read.ReadBuffer;
@@ -989,6 +996,58 @@ Return Value:
 
             leave;
         }
+
+        //
+        //  Get file name
+        //
+
+        status = FltGetFileNameInformation( Data,
+                                            FLT_FILE_NAME_NORMALIZED |
+                                            FLT_FILE_NAME_QUERY_DEFAULT,
+                                            &filenameInfo );
+
+        if (NT_SUCCESS( status )) {
+
+            status = FltParseFileNameInformation( filenameInfo );
+
+            if (NT_SUCCESS( status )) {
+                const static UNICODE_STRING nullstr = RTL_CONSTANT_STRING( L"(null)" );
+
+                PT_DBG_PRINTEX( PTDBG_TRACE_OPERATION_STATUS, DPFLTR_INFO_LEVEL,
+                    "FsFltStrhide!StrhidePreRead: Obtained file name information:\n"
+                        "\t Name      : %wZ\n"
+                        "\t Volume    : %wZ\n"
+                        "\t Share     : %wZ\n"
+                        "\t Extension : %wZ\n"
+                        "\t Stream    : %wZ\n"
+                        "\t Fin.Comp  : %wZ\n"
+                        "\t ParentDir : %wZ\n",
+                    &filenameInfo->Name,
+                    &filenameInfo->Volume ? &filenameInfo->Volume : &nullstr,
+                    &filenameInfo->Share ? &filenameInfo->Share : &nullstr,
+                    &filenameInfo->Extension ? &filenameInfo->Extension : &nullstr,
+                    &filenameInfo->Stream ? &filenameInfo->Stream : &nullstr,
+                    &filenameInfo->FinalComponent ? &filenameInfo->FinalComponent : &nullstr,
+                    &filenameInfo->ParentDir ? &filenameInfo->ParentDir : &nullstr );
+            }
+            else { // Failed to parse file information
+
+                PT_DBG_PRINTEX( PTDBG_TRACE_OPERATION_STATUS, DPFLTR_INFO_LEVEL | DPFLTR_WARNING_LEVEL,
+                    "FsFltStrhide!StrhidePreRead: Obtained file name information (parse failed):\n"
+                        "\t Name      : %wZ\n",
+                    &filenameInfo->Name );
+            }
+        }
+        else {
+
+            PT_DBG_PRINTEX( PTDBG_TRACE_ERROR, DPFLTR_ERROR_LEVEL,
+                "FsFltStrhide!StrhidePreRead: Failed to get file name information (CallbackData = %p, FileObject = %p)\n",
+                Data,
+                FltObjects->FileObject );
+
+            leave;
+        }
+
 
         //
         //  Get our volume context so we can display our volume name in the
@@ -1023,6 +1082,10 @@ Return Value:
 
         if (volCtx != NULL) {
             FltReleaseContext( volCtx );
+        }
+
+        if (filenameInfo != NULL) {
+            FltReleaseFileNameInformation( filenameInfo );
         }
     }
 
