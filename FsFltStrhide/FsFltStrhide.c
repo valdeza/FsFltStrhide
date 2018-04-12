@@ -46,7 +46,8 @@ ULONG gTraceFlags = 0x7;
 Pool Tags
 *************************************************************************/
 
-#define CONTEXT_TAG         'xcBS'
+#define VOLCONTEXT_TAG      'xcBS'
+#define FILECONTEXT_TAG     'flSH'
 #define NAME_TAG            'mnBS'
 
 /*************************************************************************
@@ -76,6 +77,28 @@ typedef struct _VOLUME_CONTEXT {
 
 #define MIN_SECTOR_SIZE 0x200
 
+
+//
+//  File context data structure
+//
+
+typedef struct _FILE_CONTEXT {
+
+    //
+    //  Name of the file associated with this context.
+    //
+
+    UNICODE_STRING FileName;
+
+    //
+    //  There is no resource to protect the context since the
+    //  filename in the context is never modified. The filename
+    //  is put in when the context is created and then freed
+    //  with context is cleaned-up
+    //
+
+} FILE_CONTEXT, *PFILE_CONTEXT;
+
 /*************************************************************************
     Prototypes
 *************************************************************************/
@@ -98,7 +121,7 @@ FsFltStrhideInstanceSetup (
     );
 
 VOID
-CleanupVolumeContext(
+CleanupContext(
     _In_ PFLT_CONTEXT Context,
     _In_ FLT_CONTEXT_TYPE ContextType
     );
@@ -179,7 +202,7 @@ EXTERN_C_END
 #pragma alloc_text(PAGE, FsFltStrhideUnload)
 #pragma alloc_text(PAGE, FsFltStrhideInstanceQueryTeardown)
 #pragma alloc_text(PAGE, FsFltStrhideInstanceSetup)
-#pragma alloc_text(PAGE, CleanupVolumeContext)
+#pragma alloc_text(PAGE, CleanupContext)
 #pragma alloc_text(PAGE, FsFltStrhideInstanceTeardownStart)
 #pragma alloc_text(PAGE, FsFltStrhideInstanceTeardownComplete)
 #pragma alloc_text(PAGE, StrhidePreRead)
@@ -402,9 +425,15 @@ CONST FLT_CONTEXT_REGISTRATION ContextNotifications[] = {
 
      { FLT_VOLUME_CONTEXT,
        0,
-       CleanupVolumeContext,
+       CleanupContext,
        sizeof(VOLUME_CONTEXT),
-       CONTEXT_TAG },
+       VOLCONTEXT_TAG },
+
+     { FLT_FILE_CONTEXT,
+       0,
+       CleanupContext,
+       sizeof(FILE_CONTEXT),
+       FILECONTEXT_TAG },
 
      { FLT_CONTEXT_END }
 };
@@ -471,7 +500,9 @@ Return Value:
 --*/
 {
     PDEVICE_OBJECT devObj = NULL;
-    PVOLUME_CONTEXT ctx = NULL;
+    PVOLUME_CONTEXT volctx = NULL;
+    PFILE_CONTEXT filctx = NULL;
+    PFLT_FILE_NAME_INFORMATION filenameInfo = NULL;
     NTSTATUS status = STATUS_SUCCESS;
     ULONG retLen;
     PUNICODE_STRING workingName;
@@ -490,6 +521,8 @@ Return Value:
 
     try {
 
+#pragma region VolumeContextInit
+
         //
         //  Allocate a volume context structure.
         //
@@ -498,7 +531,7 @@ Return Value:
                                      FLT_VOLUME_CONTEXT,
                                      sizeof(VOLUME_CONTEXT),
                                      NonPagedPool,
-                                     &ctx );
+                                     &volctx );
 
         if (!NT_SUCCESS(status)) {
 
@@ -536,13 +569,13 @@ Return Value:
 
         FLT_ASSERT((volProp->SectorSize == 0) || (volProp->SectorSize >= MIN_SECTOR_SIZE));
 
-        ctx->SectorSize = max(volProp->SectorSize,MIN_SECTOR_SIZE);
+        volctx->SectorSize = max(volProp->SectorSize,MIN_SECTOR_SIZE);
 
         //
         //  Init the buffer field (which may be allocated later).
         //
 
-        ctx->Name.Buffer = NULL;
+        volctx->Name.Buffer = NULL;
 
         //
         //  Get the storage device object we want a name for.
@@ -557,7 +590,7 @@ Return Value:
             //  an allocated name buffer.  If not, it will be NULL
             //
 
-            status = IoVolumeDeviceToDosName( devObj, &ctx->Name );
+            status = IoVolumeDeviceToDosName( devObj, &volctx->Name );
         }
 
         //
@@ -566,7 +599,7 @@ Return Value:
 
         if (!NT_SUCCESS(status)) {
 
-            FLT_ASSERT(ctx->Name.Buffer == NULL);
+            FLT_ASSERT(volctx->Name.Buffer == NULL);
 
             //
             //  Figure out which name to use from the properties
@@ -601,11 +634,11 @@ Return Value:
             //  Now allocate a buffer to hold this name
             //
 
-#pragma prefast(suppress:__WARNING_MEMORY_LEAK, "ctx->Name.Buffer will not be leaked because it is freed in CleanupVolumeContext")
-            ctx->Name.Buffer = ExAllocatePoolWithTag( NonPagedPool,
+#pragma prefast(suppress:__WARNING_MEMORY_LEAK, "volctx->Name.Buffer will not be leaked because it is freed in CleanupContext")
+            volctx->Name.Buffer = ExAllocatePoolWithTag( NonPagedPool,
                                                       size,
                                                       NAME_TAG );
-            if (ctx->Name.Buffer == NULL) {
+            if (volctx->Name.Buffer == NULL) {
 
                 status = STATUS_INSUFFICIENT_RESOURCES;
                 leave;
@@ -615,21 +648,21 @@ Return Value:
             //  Init the rest of the fields
             //
 
-            ctx->Name.Length = 0;
-            ctx->Name.MaximumLength = size;
+            volctx->Name.Length = 0;
+            volctx->Name.MaximumLength = size;
 
             //
             //  Copy the name in
             //
 
-            RtlCopyUnicodeString( &ctx->Name,
+            RtlCopyUnicodeString( &volctx->Name,
                                   workingName );
 
             //
             //  Put a trailing colon to make the display look good
             //
 
-            RtlAppendUnicodeToString( &ctx->Name,
+            RtlAppendUnicodeToString( &volctx->Name,
                                       L":" );
         }
 
@@ -639,7 +672,7 @@ Return Value:
 
         status = FltSetVolumeContext( FltObjects->Volume,
                                       FLT_SET_CONTEXT_KEEP_IF_EXISTS,
-                                      ctx,
+                                      volctx,
                                       NULL );
 
         //
@@ -649,8 +682,8 @@ Return Value:
         PT_DBG_PRINTEX( PTDBG_TRACE_OPERATION_STATUS, DPFLTR_TRACE_LEVEL,
             "FsFltStrhide!FsFltStrhideInstanceSetup:                  Real SectSize=0x%04x, Used SectSize=0x%04x, Name=\"%wZ\"\n",
                     volProp->SectorSize,
-                    ctx->SectorSize,
-                    &ctx->Name);
+                    volctx->SectorSize,
+                    &volctx->Name);
 
         //
         //  It is OK for the context to already be defined.
@@ -660,19 +693,73 @@ Return Value:
 
             status = STATUS_SUCCESS;
         }
+        else if (!NT_SUCCESS(status)) {
+
+            // h e r e   w e   g o
+            // (I think I'll just go ahead and try to make a file context)
+            PT_DBG_PRINTEX( PTDBG_TRACE_ERROR, DPFLTR_ERROR_LEVEL,
+                "FsFltStrhide!FsFltStrhideInstanceSetup: Failed to set volume context with volume %wZ\n",
+                &volctx->Name);
+        }
+
+#pragma endregion
+
+#pragma region FileContextInit
+
+        //
+        //  Allocate a file context structure.
+        //
+
+        status = FltAllocateContext( FltObjects->Filter,
+                                     FLT_FILE_CONTEXT,
+                                     sizeof(FILE_CONTEXT),
+                                     NonPagedPool,
+                                     &filctx );
+
+        if (!NT_SUCCESS(status)) {
+
+            //
+            //  We could not allocate a context, quit now
+            //
+
+            PT_DBG_PRINTEX( PTDBG_TRACE_ERROR, DPFLTR_ERROR_LEVEL,
+                "FsFltStrhide!FsFltStrhideInstanceSetup: Failed to create file context with status 0x%x. (FltObjects @ %p)\n",
+                status,
+                FltObjects );
+
+            leave;
+        }
+
+        status = FltGetFileNameInformationUnsafe( FltObjects->FileObject,
+                                                  FltObjects->Instance,
+                                                  FLT_FILE_NAME_NORMALIZED |
+                                                  FLT_FILE_NAME_QUERY_DEFAULT,
+                                                  &filenameInfo );
+
+#pragma endregion
 
     } finally {
 
+        if (filenameInfo) {
+
+            FltReleaseFileNameInformation( filenameInfo );
+        }
+
         //
-        //  Always release the context.  If the set failed, it will free the
-        //  context.  If not, it will remove the reference added by the set.
-        //  Note that the name buffer in the ctx will get freed by the context
-        //  cleanup routine.
+        //  Always release the contexts.  If the sets failed, it will free the
+        //  contexts.  If not, it will remove the references added by the sets.
+        //  Note that the UNICODE_STRING buffers in the contexts will get freed
+        //  by the context cleanup routine.
         //
 
-        if (ctx) {
+        if (volctx) {
 
-            FltReleaseContext( ctx );
+            FltReleaseContext( volctx );
+        }
+
+        if (filctx) {
+
+            FltReleaseContext( filctx );
         }
 
         //
@@ -691,7 +778,7 @@ Return Value:
 
 
 VOID
-CleanupVolumeContext(
+CleanupContext(
     _In_ PFLT_CONTEXT Context,
     _In_ FLT_CONTEXT_TYPE ContextType
     )
@@ -700,7 +787,7 @@ CleanupVolumeContext(
 Routine Description:
 
     The given context is being freed.
-    Free the allocated name buffer if there one.
+    Free allocated string buffers if applicable.
 
 Arguments:
 
@@ -714,18 +801,29 @@ Return Value:
 
 --*/
 {
-    PVOLUME_CONTEXT ctx = Context;
-
     PAGED_CODE();
 
-    UNREFERENCED_PARAMETER( ContextType );
+    FLT_ASSERT(ContextType == FLT_VOLUME_CONTEXT
+            || ContextType == FLT_FILE_CONTEXT);
 
-    FLT_ASSERT(ContextType == FLT_VOLUME_CONTEXT);
+    if (ContextType == FLT_VOLUME_CONTEXT) {
+        PVOLUME_CONTEXT ctx = Context;
 
-    if (ctx->Name.Buffer != NULL) {
+        // Free the allocated name buffer if there is one.
+        if (ctx->Name.Buffer != NULL) {
 
-        ExFreePool(ctx->Name.Buffer);
-        ctx->Name.Buffer = NULL;
+            ExFreePool(ctx->Name.Buffer);
+            ctx->Name.Buffer = NULL;
+        }
+    } else { // ContextType == FLT_FILE_CONTEXT
+        PFILE_CONTEXT ctx = Context;
+
+        // Free the allocated name buffer if there is one.
+        if (ctx->FileName.Buffer != NULL) {
+
+            ExFreePool(ctx->FileName.Buffer);
+            ctx->FileName.Buffer = NULL;
+        }
     }
 }
 
@@ -977,8 +1075,11 @@ Return Value:
     PFLT_IO_PARAMETER_BLOCK iopb = Data->Iopb;
     FLT_PREOP_CALLBACK_STATUS retValue = FLT_PREOP_SUCCESS_NO_CALLBACK;
     PVOLUME_CONTEXT volCtx = NULL;
+    PFILE_CONTEXT filCtx = NULL;
     PFLT_FILE_NAME_INFORMATION filenameInfo = NULL;
+    //UNICODE_STRING filename; //UNREFERENCED
 
+    BOOLEAN isFileContextSupported = FALSE;
     NTSTATUS status;
     ULONG readLen = iopb->Parameters.Read.Length;
     PVOID readbufAddr = iopb->Parameters.Read.ReadBuffer;
@@ -1050,29 +1151,57 @@ Return Value:
 
 
         //
-        //  Get our volume context so we can display our volume name in the
-        //  debug output.
+        //  (Try to) Get our file context so we can display the file name
+        //  in the debug output.
         //
 
-        status = FltGetVolumeContext( FltObjects->Filter,
-                                      FltObjects->Volume,
-                                      &volCtx );
+        isFileContextSupported = 
+            FltSupportsFileContextsEx( FltObjects->FileObject,
+                                       FltObjects->Instance );
+
+        if (isFileContextSupported) {
+
+            status = FltGetVolumeContext( FltObjects->Filter,
+                                          FltObjects->Volume,
+                                          &volCtx );
+
+            if (!NT_SUCCESS(status)) {
+
+                PT_DBG_PRINTEX( PTDBG_TRACE_ERROR, DPFLTR_ERROR_LEVEL,
+                    "FsFltStrhide!StrhidePreRead: Error getting volume context, status=%x\n",
+                    status);
+
+                leave;
+            }
+        }
+
+        //
+        //  Get our file context so we can display.. stuff. //TODO UPDATE
+        //
+
+        status = FltGetFileContext( FltObjects->Instance,
+                                    FltObjects->FileObject,
+                                    &filCtx );
 
         if (!NT_SUCCESS(status)) {
 
             PT_DBG_PRINTEX( PTDBG_TRACE_ERROR, DPFLTR_ERROR_LEVEL,
-                "FsFltStrhide!StrhidePreRead: Error getting volume context, status=%x\n",
+                "FsFltStrhide!StrhidePreRead: Error getting file context, status=%x\n",
                 status);
 
             leave;
         }
 
         PT_DBG_PRINTEX( PTDBG_TRACE_OPERATION_STATUS, DPFLTR_TRACE_LEVEL,
-            "FsFltStrhide!StrhidePreRead: %wZ bufaddr=%p mdladdr=%p len=%d\n",
+            "FsFltStrhide!StrhidePreRead: [VOLUME_CONTEXT] %wZ bufaddr=%p mdladdr=%p len=%d\n",
             &volCtx->Name,
             iopb->Parameters.Read.ReadBuffer,
             iopb->Parameters.Read.MdlAddress,
             readLen);
+
+        PT_DBG_PRINTEX( PTDBG_TRACE_OPERATION_STATUS, DPFLTR_TRACE_LEVEL,
+            "FsFltStrhide!StrhidePreRead: [FILE_CONTEXT] FileName=%wZ\n",
+            &filCtx->FileName);
 
     } finally {
 
@@ -1082,6 +1211,10 @@ Return Value:
 
         if (volCtx != NULL) {
             FltReleaseContext( volCtx );
+        }
+
+        if (filCtx != NULL) {
+            FltReleaseContext( filCtx );
         }
 
         if (filenameInfo != NULL) {
