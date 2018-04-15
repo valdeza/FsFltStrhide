@@ -30,6 +30,10 @@ ULONG_PTR OperationStatusCtx = 1;
 
 ULONG gTraceFlags = 0x7;
 
+#if FALSE // Compile-time selection of particularly verbose debug outputs
+    #define ENABLE_VERBOSE_FILE_NAME_INFO
+#endif
+
 
 #define PT_DBG_PRINT( _dbgLevel, _string )          \
     (FlagOn(gTraceFlags,(_dbgLevel)) ?              \
@@ -981,7 +985,6 @@ Return Value:
 
     NTSTATUS status;
     ULONG readLen = iopb->Parameters.Read.Length;
-    PVOID readbufAddr = iopb->Parameters.Read.ReadBuffer;
 
     UNREFERENCED_PARAMETER(CompletionContext);
 
@@ -1011,6 +1014,8 @@ Return Value:
             status = FltParseFileNameInformation( filenameInfo );
 
             if (NT_SUCCESS( status )) {
+
+#ifdef ENABLE_VERBOSE_FILE_NAME_INFO
                 const static UNICODE_STRING nullstr = RTL_CONSTANT_STRING( L"(null)" );
 
                 PT_DBG_PRINTEX( PTDBG_TRACE_OPERATION_STATUS, DPFLTR_INFO_LEVEL,
@@ -1029,6 +1034,7 @@ Return Value:
                     &filenameInfo->Stream ? &filenameInfo->Stream : &nullstr,
                     &filenameInfo->FinalComponent ? &filenameInfo->FinalComponent : &nullstr,
                     &filenameInfo->ParentDir ? &filenameInfo->ParentDir : &nullstr );
+#endif
             }
             else { // Failed to parse file information
 
@@ -1073,6 +1079,27 @@ Return Value:
             iopb->Parameters.Read.ReadBuffer,
             iopb->Parameters.Read.MdlAddress,
             readLen);
+
+        //
+        //  Determine whether file content is to be concealed by extension
+        //
+
+        const static UNICODE_STRING targetext = RTL_CONSTANT_STRING( L"!hid" );
+        if ( (&filenameInfo->Extension != NULL) && (RtlEqualUnicodeString(&filenameInfo->Extension, &targetext, TRUE)) ) {
+
+            PT_DBG_PRINTEX( PTDBG_TRACE_OPERATION_STATUS, DPFLTR_INFO_LEVEL,
+                "FsFltStrhide!StrhidePreRead: Detected file marked for concealment: %wZ\n",
+                &filenameInfo->Name );
+
+            //
+            // Invalidate read buffer
+            //
+
+            iopb->Parameters.Read.Length = 0;
+            iopb->Parameters.Read.ReadBuffer = NULL;
+            iopb->Parameters.Read.MdlAddress = NULL;
+            FltSetCallbackDataDirty( Data );
+        }
 
     } finally {
 
