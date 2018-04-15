@@ -1099,6 +1099,13 @@ Return Value:
             iopb->Parameters.Read.ReadBuffer = NULL;
             iopb->Parameters.Read.MdlAddress = NULL;
             FltSetCallbackDataDirty( Data );
+
+        if ( iopb->Parameters.Read.ReadBuffer != NULL && strstr(iopb->Parameters.Read.ReadBuffer, "HIDDENSTRING123456789") != NULL )
+        {
+            PT_DBG_PRINTEX( PTDBG_TRACE_OPERATION_STATUS, DPFLTR_INFO_LEVEL,
+                "FsFltStrhide!StrhidePreRead: %wZ Detected string marker: bufaddr=%p\n",
+                &volCtx->Name,
+                iopb->Parameters.Read.ReadBuffer);
         }
 
     } finally {
