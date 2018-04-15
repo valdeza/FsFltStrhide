@@ -7,9 +7,10 @@ We do not make any warranties about the reliability of this driver. **Any action
 
 Description
 ============
-[A Windows filesystem minifilter driver](https://msdn.microsoft.com/library/windows/hardware/ff540402) [[alt-link]](https://docs.microsoft.com/en-us/windows-hardware/drivers/ifs/file-system-minifilter-drivers).  
-Currently does nothing but write kernel debug output when standard driver routines are ran.  
-Sometime in the future, should detect and hide marked text from the user.
+A Windows filesystem minifilter driver [(more info: MSDN)](https://msdn.microsoft.com/library/windows/hardware/ff540402).  
+While driver is loaded on a target system, _most_ read attempts from files with extension .!hid will return blank.
+
+Verbose output to attached kernel debugger available (and enabled by default).
 
 Background
 ===========
